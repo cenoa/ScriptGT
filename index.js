@@ -38,7 +38,7 @@
     // les constructions déjà en cours). Un bâtiment absent du monde est
     // ignoré. C'est un plan de départ : modifie-le librement.
     buildOrder: [
-      ['main', 5], ['wood', 5], ['stone', 5], ['iron', 5], ['farm', 5], ['storage', 5],
+      ['wood', 5], ['stone', 5], ['iron', 5], ['main', 5], ['farm', 5], ['storage', 5],
       ['main', 10], ['barracks', 5], ['wood', 10], ['stone', 10], ['iron', 10],
       ['farm', 10], ['storage', 10],
       ['smith', 5], ['stable', 5], ['market', 5], ['barracks', 10], ['main', 15],
