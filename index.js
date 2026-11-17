@@ -107,7 +107,7 @@ window.BuildHelper.UI = (function (Config) {
   const showProposal = function (name, level, onConfirm) {
     const label = Config.labels[name];
     const html = `
-      <h3>BuildHelper</h3>
+      <h3>Builder</h3>
       <p>Prochain bâtiment proposé :<br>
          <b>${label}</b> : niveau ${level} → ${level + 1}</p>
       <input type="button" class="btn buildHelperConfirm" value="Construire">`;
