@@ -2,7 +2,7 @@
  * BuildHelper : panneau d'aide pour Guerres Tribales
  * --------------------------------------------------
  * Affiche un panneau fixe à droite de l'écran (fermable avec la croix) avec :
- *   - en haut : le ratio  points du village / pop utilisée par les troupes
+ *   - en haut : le ratio  pop des soldats / points du village
  *   - la liste de TOUS les bâtiments du monde et leur niveau
  *   - la liste des troupes présentes dans le village (+ rôle Off / Def)
  *   - un choix : gérer les bâtiments OU gérer les troupes
@@ -57,14 +57,14 @@ window.BuildHelper.Config = {
   // dépasse 10 % de leur population totale.
   balanceTolerance: 0.1,
 
-  // --- Ratio points / pop ------------------------------------------
+  // --- Ratio pop / points ------------------------------------------
   // Unités ignorées dans le calcul de la pop des troupes
   ratioIgnore: ['spy'],
 
-  // Au-dessus de cette valeur (points du village / pop des troupes), on
+  // En dessous de cette valeur (pop des soldats / points du village), on
   // considère qu'il y a trop peu de soldats et on propose d'en recruter.
-  // 1.5 est une valeur de départ : ajuste-la selon ton expérience.
-  maxPointsPerPop: 1.5,
+  // 0.7 est une valeur de départ : ajuste-la selon ton expérience.
+  minPopPerPoint: 0.7,
 
   // --- Noms affichés (si un nom manque, le nom interne est affiché) -
   buildingLabels: {
@@ -200,26 +200,27 @@ window.BuildHelper.Planner = (function (Config) {
     return { off, def, role };
   };
 
-  // RATIO : points du village / pop utilisée par les troupes (sans éclaireurs).
-  // Plus le ratio est haut, moins le village a de soldats par rapport à sa taille.
+  // RATIO : pop utilisée par les soldats (sans éclaireurs) / points du village.
+  // Plus le ratio est bas, moins le village a de soldats par rapport à sa taille.
   const computeRatio = function (troops, points) {
     let pop = 0;
     Object.keys(troops).forEach((u) => {
       if (Config.ratioIgnore.indexOf(u) === -1) pop += troops[u] * (Config.unitPop[u] || 0);
     });
 
+    const ratio = points > 0 ? pop / points : null; // null = points inconnus
     return {
       points: points,
       pop: pop,
-      ratio: pop > 0 ? points / pop : null, // null = aucune troupe
-      high: points > 0 && (pop === 0 || points / pop > Config.maxPointsPerPop),
+      ratio: ratio,
+      low: ratio !== null && ratio < Config.minPopPerPoint,
     };
   };
 
   // TROUPES, étape 2 : proposer une unité à recruter. Deux raisons possibles :
   //   1. un déséquilibre dans la paire d'unités (lancier / épéiste ou
   //      hache / cavalerie légère), seulement si les DEUX existent déjà
-  //   2. un ratio points / pop trop élevé
+  //   2. un ratio pop / points trop faible
   // Renvoie null s'il n'y a aucune raison de recruter.
   const chooseRecruit = function (troops, analysis, ratioInfo) {
     // Côté à renforcer : celui du rôle ; si Mixte, le côté le plus faible
@@ -257,8 +258,8 @@ window.BuildHelper.Planner = (function (Config) {
       }
     }
 
-    if (ratioInfo && ratioInfo.high) {
-      reasons.push('Ratio points / pop élevé : pas assez de soldats.');
+    if (ratioInfo && ratioInfo.low) {
+      reasons.push('Ratio pop / points faible : pas assez de soldats.');
     }
 
     if (reasons.length === 0) return null;
@@ -302,7 +303,7 @@ window.BuildHelper.Panel = (function (Config) {
           <b>BuildHelper</b>
           <a href="#" id="bhClose" title="Fermer">✕</a>
         </div>
-        <div id="bhRatio">Points / pop : chargement…</div>
+        <div id="bhRatio">Pop soldats / points : chargement…</div>
         <div class="bh-section"><b>Bâtiments</b><div class="bh-list" id="bhBuildings"></div></div>
         <div class="bh-section"><b>Troupes</b><div class="bh-list" id="bhTroops">Chargement…</div></div>
         <div class="bh-section">
@@ -328,14 +329,14 @@ window.BuildHelper.Panel = (function (Config) {
   // Ratio en haut du panneau. info = null si les points sont introuvables.
   const renderRatio = function (info) {
     if (info === null) {
-      $('#bhRatio').text('Points / pop : indisponible');
+      $('#bhRatio').text('Pop soldats / points : indisponible');
       return;
     }
-    const value = info.ratio === null ? '∞' : info.ratio.toFixed(2);
-    const warn = info.high ? ' <span class="bh-warn">⚠ élevé</span>' : '';
+    const value = info.ratio.toFixed(2);
+    const warn = info.low ? ' <span class="bh-warn">⚠ faible</span>' : '';
     $('#bhRatio').html(
-      `Points / pop troupes : <b>${value}</b>${warn}<br>
-       <small>${fmt(info.points)} pts / ${fmt(info.pop)} pop (sans éclaireurs)</small>`
+      `Pop soldats / points : <b>${value}</b>${warn}<br>
+       <small>${fmt(info.pop)} pop (sans éclaireurs) / ${fmt(info.points)} pts</small>`
     );
   };
 
@@ -362,7 +363,7 @@ window.BuildHelper.Panel = (function (Config) {
 
   const renderTroopsError = function () {
     $('#bhTroops').text('Impossible de lire les troupes.');
-    $('#bhRatio').text('Points / pop : indisponible');
+    $('#bhRatio').text('Pop soldats / points : indisponible');
   };
 
   // Zone du bas : la proposition + éventuellement un bouton.
@@ -472,7 +473,7 @@ window.BuildHelper.Main = (function (Config, Data, Planner, Panel) {
     Panel.onModeTroops(proposeTroops);
 
     // Étape 4 : charger les troupes (demande au serveur, donc un peu plus lent),
-    // puis calculer le rôle du village et le ratio points / pop
+    // puis calculer le rôle du village et le ratio pop / points
     Data.fetchTroops().then(
       function (troops) {
         state.troops = troops;
