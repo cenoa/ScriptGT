@@ -9,10 +9,12 @@
  *   - changer de village (liste + flèches) ; le jeu suit
  *   - voir les constructions et les formations en cours
  *     (caserne, écurie et atelier ont chacun leur propre file)
- *   - gérer les BÂTIMENTS : plan de construction + urgences
- *     (entrepôt ou ferme presque pleins)
+ *   - gérer les BÂTIMENTS : le moins cher d'abord, mines équilibrées,
+ *     quartier général si il va plus vite, urgences entrepôt / ferme
  *   - gérer les TROUPES : équilibrer, sinon recruter davantage
  *     (ratio pop des soldats / points du village)
+ *   - gérer la FORGE : améliorer les troupes du rôle du village
+ *   - bouton "Suivant" : bâtiments -> troupes -> forge -> village suivant
  *
  * Rien n'est validé sans ton clic. Pour le recrutement, la fenêtre ouvre la
  * bonne page et saisit la quantité : c'est toi qui cliques sur "Recruter".
@@ -32,29 +34,26 @@
    * 1. CONFIG : tes réglages
    * ================================================================= */
   const Config = {
-    // --- Plan de construction ---------------------------------------
-    // Liste d'étapes [bâtiment, niveau à atteindre], dans l'ordre.
-    // Le script propose la première étape pas encore atteinte (en comptant
-    // les constructions déjà en cours). Un bâtiment absent du monde est
-    // ignoré. C'est un plan de départ : modifie-le librement.
-    buildOrder: [
-      ['wood', 5], ['stone', 5], ['iron', 5], ['main', 5], ['farm', 5], ['storage', 5],
-      ['main', 10], ['barracks', 5], ['wood', 10], ['stone', 10], ['iron', 10],
-      ['farm', 10], ['storage', 10],
-      ['smith', 5], ['stable', 5], ['market', 5], ['barracks', 10], ['main', 15],
-      ['wood', 15], ['stone', 15], ['iron', 15], ['farm', 15], ['storage', 15],
-      ['wall', 5], ['hide', 5],
-      ['stable', 10], ['smith', 10], ['barracks', 15], ['main', 20],
-      ['wood', 20], ['stone', 20], ['iron', 20], ['farm', 20], ['storage', 20],
-      ['barracks', 20], ['stable', 15], ['smith', 15], ['market', 10], ['wall', 10],
-      ['wood', 25], ['stone', 25], ['iron', 25], ['farm', 25], ['storage', 25],
-      ['barracks', 25], ['stable', 20], ['smith', 20], ['wall', 15],
-      ['wood', 30], ['stone', 30], ['iron', 30], ['farm', 30], ['storage', 30],
-    ],
+    // --- Bâtiments ----------------------------------------------------
+    // Niveau maximum voulu pour chaque bâtiment. Un bâtiment absent de cette
+    // liste (ou absent du monde) n'est jamais proposé (sauf urgences).
+    targets: {
+      main: 20, barracks: 25, stable: 20, smith: 20, market: 10,
+      wood: 30, stone: 30, iron: 30, farm: 30, storage: 30,
+      wall: 15, hide: 10,
+    },
 
-    // Urgences : si une ressource atteint 90 % de l'entrepôt, ou si la
-    // population atteint 90 % de la ferme, on propose d'abord de les agrandir
-    // (jusqu'à ces niveaux maximum).
+    // Mines à équilibrer : une seule est candidate, la moins avancée
+    mines: ['wood', 'stone', 'iron'],
+
+    // Le script choisit en général le bâtiment le MOINS CHER (bois + argile +
+    // fer). Ce coefficient ajuste le coût "ressenti" : en dessous de 1 le
+    // bâtiment est favorisé, au-dessus de 1 il est retardé (défaut : 1).
+    weights: { wood: 0.8, stone: 0.8, iron: 0.8, market: 1.3, wall: 1.5, hide: 1.5 },
+
+    // Urgences : entrepôt si une ressource atteint 90 % de sa capacité (ou
+    // s'il est trop petit pour le prochain bâtiment), ferme si la population
+    // atteint 90 % de sa capacité. Niveaux maximum pour ces urgences :
     fullRatio: 0.9,
     emergencyMax: { storage: 30, farm: 30 },
 
@@ -84,7 +83,7 @@
 
     // --- Divers -------------------------------------------------------
     trainBuildings: ['barracks', 'stable', 'garage'], // chacun a sa propre file
-    autoRefreshSeconds: 60, // mise à jour automatique si la page ne change pas
+    autoRefreshSeconds: 120, // mise à jour automatique si la page ne change pas
 
     // --- Noms affichés (si un nom manque, le nom interne est affiché) ---
     buildingLabels: {
@@ -140,6 +139,8 @@
       snap: null,         // infos du village affiché dans le jeu
       buildQueue: [],     // constructions en cours [{name, time}]
       buildable: {},      // "bâtiment:niveau" -> true si constructible
+      buildInfo: {},      // coûts et durées par bâtiment (écran "main")
+      smith: undefined,   // techniques recherchables (null = pas de forge)
       train: {},          // file de chaque bâtiment militaire (null = non construit)
       troops: {},         // troupes présentes dans le village
       villages: [],       // liste des villages [{id, label}]
@@ -233,6 +234,67 @@
       return ok;
     };
 
+    // "0:12:34" -> secondes (null si ce n'est pas une durée)
+    const timeToSeconds = (txt) => {
+      const m = String(txt).trim().match(/^(\d+):(\d{2}):(\d{2})$/);
+      return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : null;
+    };
+    const fmtTime = (sec) => {
+      const h = Math.floor(sec / 3600);
+      const m = Math.floor((sec % 3600) / 60);
+      const r = sec % 60;
+      return h + ':' + String(m).padStart(2, '0') + ':' + String(r).padStart(2, '0');
+    };
+
+    // Coûts et durée du PROCHAIN niveau de chaque bâtiment (écran "main") :
+    // lignes #main_buildrow_<bâtiment>, cellules .cost_wood / .cost_stone /
+    // .cost_iron (attribut data-cost), la durée est la cellule au format h:mm:ss.
+    // À VÉRIFIER avec l'inspecteur si les coûts restent illisibles.
+    const parseBuildInfo = (doc) => {
+      const info = {};
+      doc.querySelectorAll('tr[id^="main_buildrow_"]').forEach((row) => {
+        const name = row.id.replace('main_buildrow_', '');
+        const cost = (res) => {
+          const c = row.querySelector('.cost_' + res);
+          if (!c) return null;
+          const dc = c.getAttribute('data-cost');
+          return digits(dc !== null ? dc : c.textContent);
+        };
+        const wood = cost('wood');
+        const stone = cost('stone');
+        const iron = cost('iron');
+        let time = null;
+        row.querySelectorAll('td').forEach((td) => {
+          const t = timeToSeconds(td.textContent);
+          if (t !== null && time === null) time = t;
+        });
+        const btn = row.querySelector('a.btn-build');
+        info[name] = {
+          wood: wood, stone: stone, iron: iron,
+          total: wood !== null && stone !== null && iron !== null ? wood + stone + iron : null,
+          time: time,
+          hasButton: !!btn,
+          active: !!btn && !btn.classList.contains('inactive'),
+        };
+      });
+      return info;
+    };
+
+    // Techniques recherchables à la forge : liens ...action=research&id=<unité>
+    // À VÉRIFIER avec l'inspecteur si la forge ne propose rien alors qu'une
+    // amélioration est possible.
+    const parseResearch = (doc) => {
+      const list = [];
+      const seen = {};
+      doc.querySelectorAll('a[href*="action=research"]').forEach((a) => {
+        const m = (a.getAttribute('href') || '').match(/[?&]id=(\w+)/);
+        if (!m || seen[m[1]]) return;
+        seen[m[1]] = true;
+        list.push({ unit: m[1], active: !a.classList.contains('inactive'), text: a.textContent.trim() });
+      });
+      return list;
+    };
+
     // Troupes présentes : champ #unit_input_<unité>, attribut data-all-count
     const parseTroops = (doc, units) => {
       const t = {};
@@ -287,30 +349,74 @@
       return eff;
     };
 
-    // Propositions de construction (urgences d'abord, puis le plan).
-    // Renvoie jusqu'à `count` propositions [{building, from, to, reason}].
-    const planBuildings = (snap, eff, count) => {
-      const sim = Object.assign({}, eff);
+    // Propositions de construction, de la plus importante à la moins importante :
+    //   1. Urgences : entrepôt (presque plein, ou trop petit pour le meilleur
+    //      candidat), puis ferme (presque pleine)
+    //   2. Quartier général, s'il se construit plus vite que le meilleur
+    //      candidat (il raccourcit ensuite toutes les constructions)
+    //   3. Le reste, du moins cher au plus cher (coût x coefficient), avec une
+    //      seule mine candidate : la moins avancée
+    // info = coûts et durées lus sur la page du bâtiment principal.
+    const planBuildings = (snap, eff, info, count) => {
       const out = [];
-      const exists = (b) => Object.prototype.hasOwnProperty.call(sim, b);
-      const add = (b, reason) => { out.push({ building: b, from: sim[b], to: sim[b] + 1, reason: reason }); sim[b] += 1; };
+      const used = {};
+      const push = (b, reason) => {
+        if (used[b]) return;
+        used[b] = true;
+        out.push({ building: b, from: eff[b], to: eff[b] + 1, reason: reason });
+      };
+      const has = (b) => Object.prototype.hasOwnProperty.call(eff, b);
+      const wanted = (b) => has(b) && Config.targets[b] !== undefined && eff[b] < Config.targets[b];
 
-      // Urgence 1 : entrepôt presque plein
+      // Candidats : bâtiments voulus dont on connaît le coût
+      let cands = Object.keys(eff).filter((b) => wanted(b) && info[b] && info[b].total !== null);
+
+      // Une seule mine : la moins avancée (à égalité, la moins chère)
+      const mines = cands.filter((b) => Config.mines.indexOf(b) !== -1);
+      if (mines.length > 1) {
+        mines.sort((a, b) => eff[a] - eff[b] || info[a].total - info[b].total);
+        cands = cands.filter((b) => Config.mines.indexOf(b) === -1 || b === mines[0]);
+      }
+
+      // Classement : d'abord ceux qui ont un bouton "Construire" (sinon le
+      // prérequis manque), puis du moins cher au plus cher
+      const score = (b) => info[b].total * (Config.weights[b] || 1);
+      cands.sort((a, b) => {
+        if (info[a].hasButton !== info[b].hasButton) return info[a].hasButton ? -1 : 1;
+        return score(a) - score(b);
+      });
+      const best = cands[0] || null;
+
+      // 1. Urgences
+      const canGrow = (b) => has(b) && eff[b] < Config.emergencyMax[b];
       const maxRes = Math.max(snap.wood || 0, snap.stone || 0, snap.iron || 0);
-      if (snap.storage && maxRes >= snap.storage * Config.fullRatio && exists('storage') && sim.storage < Config.emergencyMax.storage) {
-        add('storage', 'Entrepôt presque plein (' + fmt(maxRes) + ' / ' + fmt(snap.storage) + ').');
+      const bestMaxCost = best ? Math.max(info[best].wood || 0, info[best].stone || 0, info[best].iron || 0) : 0;
+      if (canGrow('storage') && snap.storage) {
+        if (maxRes >= snap.storage * Config.fullRatio) {
+          push('storage', 'Urgent : entrepôt presque plein (' + fmt(maxRes) + ' / ' + fmt(snap.storage) + ').');
+        } else if (bestMaxCost > snap.storage) {
+          push('storage', "Urgent : l'entrepôt est trop petit pour " + bLabel(best) +
+            ' (coût ' + fmt(bestMaxCost) + ' > ' + fmt(snap.storage) + ').');
+        }
       }
-      // Urgence 2 : ferme presque pleine
-      if (snap.popMax && snap.pop >= snap.popMax * Config.fullRatio && exists('farm') && sim.farm < Config.emergencyMax.farm) {
-        add('farm', 'Ferme presque pleine (' + fmt(snap.pop) + ' / ' + fmt(snap.popMax) + ').');
+      if (canGrow('farm') && snap.popMax && snap.pop >= snap.popMax * Config.fullRatio) {
+        push('farm', 'Urgent : ferme presque pleine (' + fmt(snap.pop) + ' / ' + fmt(snap.popMax) + ').');
       }
-      // Plan : première étape pas encore atteinte, et ainsi de suite
-      while (out.length < count) {
-        const step = Config.buildOrder.find((s) => exists(s[0]) && sim[s[0]] < s[1]);
-        if (!step) break;
-        add(step[0], 'Plan : ' + bLabel(step[0]) + ' niveau ' + step[1] + '.');
+
+      // 2. Quartier général plus rapide que le meilleur candidat
+      if (best && best !== 'main' && wanted('main') && info.main && info.main.time !== null &&
+          info[best].time !== null && info.main.time < info[best].time) {
+        push('main', 'Quartier général : ' + fmtTime(info.main.time) + ' contre ' + fmtTime(info[best].time) +
+          ' pour ' + bLabel(best) + ', et il accélère les constructions suivantes.');
       }
-      return out;
+
+      // 3. Le reste, du moins cher au plus cher
+      cands.forEach((b) => {
+        push(b, (Config.mines.indexOf(b) !== -1 ? 'Mines équilibrées : la moins avancée. ' : '') +
+          'Coût : ' + fmt(info[b].total) + ' ressources.');
+      });
+
+      return out.slice(0, count);
     };
 
     // Rôle du village d'après la part offensive / défensive
@@ -377,9 +483,30 @@
 
       if (ratioInfo && ratioInfo.low) {
         reasons.push('Ratio pop / points faible : il manque environ ' + fmt(ratioInfo.missing) + ' pop de soldats.');
+        // Pas d'écart à combler : on propose de combler la pop manquante
+        // (la quantité sera limitée au maximum possible au moment de la saisie)
+        if (quantity === null) quantity = Math.max(1, Math.ceil(ratioInfo.missing / Config.unitPop[unit]));
       }
       if (reasons.length === 0) return null;
       return { side: side, unit: unit, quantity: quantity, reasons: reasons, building: Config.unitBuilding[unit] };
+    };
+
+    // Forge : on améliore les troupes du rôle du village, parmi celles qu'on
+    // possède (formations comprises), les plus nombreuses (en pop) d'abord.
+    // Aucune troupe = rien à améliorer. Village mixte : on suit le côté dominant.
+    const planSmith = (analysis, totals, techs) => {
+      if (analysis.role === 'vide') return { message: 'Aucune troupe : rien à améliorer.' };
+      const side = analysis.role === 'mixte' ? (analysis.off >= analysis.def ? 'off' : 'def') : analysis.role;
+      const pool = side === 'off' ? Config.offUnits : Config.defUnits;
+      const owned = pool.filter((u) => (totals[u] || 0) > 0)
+        .sort((a, b) => totals[b] * Config.unitPop[b] - totals[a] * Config.unitPop[a]);
+      const candidates = owned.map((u) => techs.find((t) => t.unit === u)).filter(Boolean);
+      if (!candidates.length) {
+        return { side: side, message: 'Aucune amélioration disponible pour tes troupes ' +
+          (side === 'off' ? 'offensives' : 'défensives') + ' (déjà au maximum, ou forge insuffisante).' };
+      }
+      const first = candidates.find((t) => t.active) || candidates[0];
+      return { side: side, candidates: candidates, first: first };
     };
 
     // Troupes présentes + troupes en formation, rôle et ratio
@@ -414,6 +541,7 @@
         const main = await fetchDoc('main', snap.id);
         state.buildQueue = parseBuildQueue(main);
         state.buildable = parseBuildable(main);
+        state.buildInfo = parseBuildInfo(main);
 
         await sleep(250);
         state.troops = parseTroops(await fetchDoc('place', snap.id), snap.units);
@@ -422,6 +550,12 @@
           if (!(snap.levels[b] > 0)) { state.train[b] = null; continue; } // non construit
           await sleep(250);
           state.train[b] = parseTrainQueue(await fetchDoc(b, snap.id), b, snap.units);
+        }
+        if (snap.levels.smith > 0) {
+          await sleep(250);
+          state.smith = parseResearch(await fetchDoc('smith', snap.id));
+        } else {
+          state.smith = null; // forge non construite
         }
         state.updatedAt = Date.now();
       } catch (e) {
@@ -494,7 +628,7 @@
       const s = state.snap;
       if (!s) return '';
       const eff = effectiveLevels(s.levels, state.buildQueue);
-      const props = planBuildings(s, eff, 5);
+      const props = planBuildings(s, eff, state.buildInfo, 5);
       const first = props[0];
       const rows = Object.keys(s.levels).map((b) => {
         const q = eff[b] - s.levels[b];
@@ -502,15 +636,24 @@
           s.levels[b] + (q ? ' (+' + q + ')' : '') + '</td></tr>';
       }).join('');
 
+      const unreadable = state.updatedAt && Object.keys(state.buildInfo).length === 0
+        ? '<div class="warn">Coûts illisibles sur la page du bâtiment principal : seules les urgences peuvent être proposées.</div>'
+        : '';
+
       let proposal;
       if (!first) {
-        proposal = 'Plan terminé : rien à proposer.';
+        proposal = 'Rien à proposer (objectifs atteints).';
       } else {
         const known = Object.keys(state.buildable).length > 0;
         const ok = state.buildable[first.building + ':' + first.to];
         const availability = !known ? '' : ok
           ? '<div>✓ constructible maintenant</div>'
           : '<div class="warn">✗ pas constructible maintenant (ressources, file pleine ou prérequis)</div>';
+        const i = state.buildInfo[first.building];
+        const costLine = i && i.total !== null
+          ? '<div>Coût : bois ' + fmt(i.wood) + ' · argile ' + fmt(i.stone) + ' · fer ' + fmt(i.iron) +
+            (i.time !== null ? ' · durée ' + fmtTime(i.time) : '') + '</div>'
+          : '';
         // Si la première proposition n'est pas constructible maintenant, on
         // signale la première des suivantes qui l'est.
         const alt = known && !ok ? props.slice(1).find((p) => state.buildable[p.building + ':' + p.to]) : null;
@@ -520,12 +663,12 @@
           : '';
         const next = props.slice(1, 4).map((p) => '• ' + esc(bLabel(p.building)) + ' → ' + p.to).join('<br>');
         proposal = `Proposition : <b>${esc(bLabel(first.building))}</b> niveau ${first.from} → ${first.to}
-          <div>${esc(first.reason)}</div>${availability}
+          <div>${esc(first.reason)}</div>${costLine}${availability}
           <div style="margin-top:4px"><button data-action="build" data-building="${esc(first.building)}" data-level="${first.to}">Construire</button></div>
           ${altBlock}
           ${next ? '<div style="margin-top:4px;font-size:11px">Ensuite :<br>' + next + '</div>' : ''}`;
       }
-      return `<div class="box">${proposal}</div>
+      return `<div class="box">${proposal}${unreadable}</div>
         <h4>Bâtiments du monde</h4><table>${rows}</table>`;
     };
 
@@ -569,13 +712,35 @@
         <div style="font-size:11px;margin-top:4px">Seules les troupes présentes au village sont comptées.</div>`;
     };
 
+    const renderSmith = () => {
+      const s = state.snap;
+      if (!s) return '';
+      if (state.smith === null) return '<div class="box">Forge non construite.</div>';
+      if (state.smith === undefined) return '<div class="box">Lecture de la forge…</div>';
+      const d = derive();
+      const plan = planSmith(d.analysis, d.totals, state.smith);
+      const role = '<div class="box">Village : <b>' + roleNames[d.analysis.role] + '</b></div>';
+      if (plan.message) return role + '<div class="box">' + esc(plan.message) + '</div>';
+
+      const rows = plan.candidates.map((t) =>
+        '<tr class="' + (t === plan.first ? 'cur' : '') + '"><td>' + esc(uLabel(t.unit)) + '</td><td>' +
+        (t.active ? 'améliorable' : 'pas maintenant') + '</td></tr>').join('');
+      const f = plan.first;
+      const proposal = 'Proposition : améliorer <b>' + esc(uLabel(f.unit)) + '</b>' +
+        (f.active ? '<div>✓ possible maintenant</div>' : '<div class="warn">✗ pas possible maintenant (ressources ou recherche en cours)</div>') +
+        '<div style="margin-top:4px"><button data-action="research" data-unit="' + esc(f.unit) + '">Améliorer</button></div>';
+      return role + '<div class="box">' + proposal + '</div><h4>Troupes du rôle</h4><table>' + rows + '</table>';
+    };
+
     const renderAll = () => {
       const tab = (mode, label) => '<button data-action="mode" data-mode="' + mode + '" class="' + (state.mode === mode ? 'active' : '') + '">' + label + '</button>';
       const pending = state.pending ? '<div class="box">⏳ Action en attente de la prochaine page du jeu…</div>' : '';
-      // On ne redessine pas la liste des villages pendant qu'elle est ouverte
+      const content = state.mode === 'troops' ? renderTroops() : state.mode === 'smith' ? renderSmith() : renderBuildings();
       $('app').innerHTML = renderHeader() + renderStatus() + pending +
-        '<div style="margin-top:8px"><b>Que veux-tu gérer ?</b> ' + tab('buildings', 'Bâtiments') + ' ' + tab('troops', 'Troupes') + '</div>' +
-        (state.mode === 'buildings' ? renderBuildings() : renderTroops());
+        '<div style="margin-top:8px"><b>Que veux-tu gérer ?</b><br>' +
+        tab('buildings', 'Bâtiments') + ' ' + tab('troops', 'Troupes') + ' ' + tab('smith', 'Forge') +
+        ' <button data-action="next" title="Bâtiments → Troupes → Forge → village suivant">Suivant ▶</button></div>' +
+        content;
     };
 
     /* =================================================================
@@ -626,12 +791,32 @@
         const input = doc.querySelector('input[name="' + p.unit + '"]') ||
           doc.querySelector('input[name="units[' + p.unit + ']"]') || doc.getElementById(p.unit + '_0');
         if (!input) { log('Champ de recrutement introuvable : saisis la quantité de ' + uLabel(p.unit) + ' à la main.'); return; }
-        input.value = p.qty > 0 ? String(p.qty) : '';
+        // Maximum recrutable avec les ressources actuelles : le nombre entre
+        // parenthèses du lien "(max)" à côté du champ (#<unité>_0_a)
+        // À VÉRIFIER avec l'inspecteur si le plafond n'est pas appliqué.
+        const maxLink = doc.getElementById(p.unit + '_0_a') || doc.querySelector('a[id^="' + p.unit + '_"][id$="_a"]');
+        const max = maxLink ? digits(maxLink.textContent) : null;
+        let qty = p.qty;
+        if (max !== null && qty > max) {
+          log('Quantité proposée (' + qty + ') au-dessus du maximum possible : ' + max + ' ' + uLabel(p.unit) + '.');
+          qty = max;
+        }
+        if (max === 0) log('Ressources insuffisantes pour recruter des ' + uLabel(p.unit) + ' maintenant.');
+        input.value = qty > 0 ? String(qty) : '';
         input.dispatchEvent(new w.Event('input', { bubbles: true }));
         input.dispatchEvent(new w.Event('change', { bubbles: true }));
         input.focus();
-        log(p.qty > 0 ? 'Quantité saisie : ' + p.qty + ' ' + uLabel(p.unit) + '. Clique sur Recruter dans le jeu.'
-                      : 'Page de recrutement ouverte : choisis la quantité de ' + uLabel(p.unit) + '.');
+        log(qty > 0 ? 'Quantité saisie : ' + qty + ' ' + uLabel(p.unit) + '. Clique sur Recruter dans le jeu.'
+                    : 'Page de recrutement ouverte : choisis la quantité de ' + uLabel(p.unit) + '.');
+      } else if (p.type === 'research') {
+        if (!onVillage || gd.screen !== 'smith') { log('Amélioration annulée : page inattendue.'); return; }
+        const re = new RegExp('[?&]id=' + p.unit + '(&|$)');
+        const link = Array.from(w.document.querySelectorAll('a[href*="action=research"]')).find((a) =>
+          re.test(a.getAttribute('href') || '') && !a.classList.contains('inactive') && a.getClientRects().length > 0);
+        if (!link) { log("Impossible d'améliorer " + uLabel(p.unit) + ' (ressources insuffisantes ou recherche en cours).'); return; }
+        link.click();
+        log('Amélioration lancée : ' + uLabel(p.unit) + '.');
+        setTimeout(refresh, 2500);
       }
       renderAll();
     };
@@ -648,6 +833,27 @@
         navigate('main', s.id);
         renderAll();
       }
+    };
+
+    const startResearch = (unit) => {
+      const s = state.snap;
+      if (!s) return;
+      state.pending = { type: 'research', village: s.id, unit: unit };
+      const gd = getGD();
+      if (gd && gd.screen === 'smith' && parseInt(gd.village.id, 10) === s.id) {
+        execPending(); // déjà à la forge : on clique tout de suite
+      } else {
+        log('Ouverture de la forge…');
+        navigate('smith', s.id);
+        renderAll();
+      }
+    };
+
+    // Bouton "Suivant" : bâtiments -> troupes -> forge -> village suivant (bâtiments)
+    const nextStep = () => {
+      if (state.mode === 'buildings') { state.mode = 'troops'; renderAll(); }
+      else if (state.mode === 'troops') { state.mode = 'smith'; renderAll(); }
+      else { state.mode = 'buildings'; renderAll(); stepVillage(1); }
     };
 
     const startRecruit = (unit, qty) => {
@@ -670,6 +876,8 @@
       else if (a === 'nextVillage') stepVillage(1);
       else if (a === 'build') startBuild(t.getAttribute('data-building'), parseInt(t.getAttribute('data-level'), 10));
       else if (a === 'recruit') startRecruit(t.getAttribute('data-unit'), parseInt(t.getAttribute('data-qty'), 10) || 0);
+      else if (a === 'research') startResearch(t.getAttribute('data-unit'));
+      else if (a === 'next') nextStep();
     });
     document.addEventListener('change', (e) => {
       if (e.target && e.target.id === 'villageSelect') switchVillage(parseInt(e.target.value, 10));
@@ -706,7 +914,7 @@
 
     window.__bhTimer = setInterval(tick, 1000);
     // Pour le dépannage : window.__bh dans la console de CETTE fenêtre
-    window.__bh = { state: state, planBuildings: planBuildings, chooseRecruit: chooseRecruit, analyseTroops: analyseTroops, computeRatio: computeRatio, parse: { parseBuildQueue, parseTrainQueue, parseVillageList, parseTroops } };
+    window.__bh = { state: state, planSmith: planSmith, planBuildings: planBuildings, chooseRecruit: chooseRecruit, analyseTroops: analyseTroops, computeRatio: computeRatio, parse: { parseBuildQueue, parseTrainQueue, parseVillageList, parseTroops } };
     tick();
   }
 
